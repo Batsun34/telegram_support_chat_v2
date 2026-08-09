@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-support-chat"
+version = "2.2.0"
+description = "Persistent Telegram support chat with ephemeral moderator workspaces"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+  "aiogram==3.30.0",
+  "SQLAlchemy==2.0.51",
+  "alembic==1.18.5",
+  "aiosqlite==0.22.1",
+  "pydantic==2.13.4",
+  "pydantic-settings==2.14.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==9.0.2",
+  "pytest-asyncio==1.3.0",
+  "ruff==0.16.2",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]

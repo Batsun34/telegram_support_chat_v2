@@ -1,0 +1,1238 @@
+diff --git a/MANIFEST.txt b/MANIFEST.txt
+index a5f997450b26a9b1c6f0301e4cb648c2819846e4..ad412c040c3641a3f7bd95653fcda1a4609fc88b 100644
+--- a/MANIFEST.txt
++++ b/MANIFEST.txt
+@@ -1,3 +1,4 @@
++
+ .env.example
+ .gitignore
+ MANIFEST.txt
+@@ -47,5 +48,6 @@ scripts/setup_venv.ps1
+ scripts/setup_venv.sh
+ tests/conftest.py
+ tests/test_chat_rules.py
++tests/test_keyboards.py
+ tests/test_rendering.py
+ tests/test_schema.py
+diff --git a/PROJECT_MAP.md b/PROJECT_MAP.md
+index 0712bcc77775493efa532ae53a995b15a229afe6..27fea070c90dd9dc0e5656c767ed2aabe0c4a314 100644
+--- a/PROJECT_MAP.md
++++ b/PROJECT_MAP.md
+@@ -1,4 +1,4 @@
+-# PROJECT MAP — Telegram Support Chat v2.1
++# PROJECT MAP — Telegram Support Chat v2.2
+ 
+ Этот файл рассчитан в том числе на передачу проекта в Codex/другому разработчику.
+ 
+@@ -142,7 +142,7 @@ Currently records moderator replies and ban/unban operations. Expand here for fu
+ 11. `Мои` means active + participant relation, not ownership.
+ 12. `last_rendered_message_id` is per moderator, not global.
+ 13. A moderator reply marks the currently pending user burst as dispatched.
+-14. Telegram read state is never fabricated.
++14. Telegram read state is never fabricated; no proxy delivery/read marker is rendered.
+ 15. Workspace deletion failures must not block switching chats.
+ 16. Per-moderator asyncio locks serialize render/delete operations inside one polling process.
+ 17. `ModeratorSerialMiddleware` serializes all message/callback updates from the same moderator, so rapid replies cannot reorder.
+@@ -151,24 +151,22 @@ Currently records moderator replies and ban/unban operations. Expand here for fu
+ 
+ `ChatService.history()` pages by **10 raw `support_messages` rows**. `domain/rendering.py` first groups consecutive text from the same logical author. `ViewService._render_page()` then buffers all adjacent text blocks until a photo or page end and packs their rendered HTML sections into as few Telegram `sendMessage` calls as possible.
+ 
+-The packer uses a conservative 3900-character ceiling. Every section keeps its own `👤/🛡` label, timestamp and moderator delivery status. A photo is always sent separately and flushes the pending text run.
++The packer counts **visible text after HTML entity parsing** and fills Telegram messages up to the Bot API 4096-character text limit. There are no artificial 2800/3000/3900 render ceilings. Every section keeps its own `👤/🛡` label and timestamp. Delivery/read proxy markers are not rendered. A photo is always sent separately and flushes the pending text run.
+ 
+-## Callback protocol
++## Moderator UI protocol
++
++Inline callbacks are used for list navigation and opening a chat:
+ 
+ ```text
+ menu
+ bucket:<new|active|mine|old>:<page>
+ chat:open:<user_id>:<history_page>
+-chat:page:<user_id>:<history_page>
+-chat:info:<user_id>
+-chat:ban:<user_id>
+-chat:ban_yes:<user_id>
+-chat:unban:<user_id>
+-chat:back
+ noop
+ ```
+ 
+-Keep callback strings below Telegram's callback_data limit.
++Old `chat:page:*` / `chat:back` / `chat:info:*` callbacks are accepted only as v2.1 compatibility for already-rendered workspaces; v2.2 does not create them.
++
++Inside an open chat, controls are a persistent reply keyboard. Reserved texts include `⬅️ Старее`, `📄 X/Y`, `Новее ➡️`, `ℹ️ Инфо`, `🚫 Бан` / `✅ Разбанить`, `◀️ К спискам`, plus ban confirmation/cancel. These handlers run before the generic moderator message handler, so control texts cannot leak to the user.
+ 
+ ## Incoming user path
+ 
+diff --git a/README.md b/README.md
+index 923063b42119adcdd6606db1dbe10a34bad2bad4..2bd63f59375ca5242a01e32d2ecc73174075a1a0 100644
+--- a/README.md
++++ b/README.md
+@@ -1,4 +1,4 @@
+-# Telegram Support Chat v2.1
++# Telegram Support Chat v2.2
+ 
+ Поддержка в Telegram без тикетов. Для пользователя бот выглядит как один постоянный личный диалог. Для модератора это временно отрисовываемое рабочее окно: он выбирает пользователя, видит историю, пишет обычным текстом/фото и может мгновенно переключиться на другой чат.
+ 
+@@ -12,7 +12,7 @@
+ - при выходе/переключении временно отрисованные сообщения удаляются из лички модератора;
+ - при повторном входе история восстанавливается из SQLite;
+ - 10 исходных сообщений на страницу, с навигацией по истории;
+-- текстовая история уплотняется в Telegram-сообщения до безопасного лимита: внутри одного сообщения могут идти секции разных авторов с отдельными `👤/🛡` заголовками; фото всегда отдельно;
++- текстовая история уплотняется до реального лимита Bot API в 4096 видимых символов после разбора HTML: внутри одного сообщения могут идти секции разных авторов с отдельными `👤/🛡` заголовками; фото всегда отдельно;
+ - если модератор сейчас открыл этот чат, каждое новое сообщение пользователя сразу дорисовывается в его текущую ленту без обновления/перерендера чата;
+ - 10-секундный debounce остаётся только для модераторов, у которых этот чат не открыт: им приходит одно компактное уведомление вместо спама по одному слову;
+ - разделы `Новые`, `Активные`, `Мои`, `Старые`;
+@@ -37,12 +37,7 @@
+ 
+ ## Статус прочтения
+ 
+-Обычный Telegram Bot API не предоставляет read receipt для личного сообщения бот → пользователь. Поэтому бот **не показывает выдуманное «прочитано»**.
+-
+-В истории честно отображаются два состояния ответа поддержки:
+-
+-- `✓ отправлено`;
+-- `↩️ после этого пользователь ответил` — значит после этого сообщения поддержки от пользователя пришло более позднее сообщение.
++Обычный Telegram Bot API не предоставляет read receipt для личного сообщения бот → пользователь. Поэтому в v2.2 история **вообще не рисует псевдо-статусы доставки/прочтения**: ни `✓ отправлено`, ни маркер о последующем ответе пользователя.
+ 
+ ## Временный чат модератора
+ 
+@@ -101,13 +96,13 @@ MODERATORS_JSON={"123456789":"Алекс","987654321":"Мария"}
+ 4. Бот удалит старое рабочее окно и покажет до 10 исходных сообщений истории.
+ 5. Любой обычный текст или фото отправляется выбранному пользователю.
+ 6. Исходное сообщение модератора по возможности удаляется и сразу перерисовывается ботом как `🛡 Имя`, чтобы текущий вид совпадал с восстановленной историей.
+-7. `◀️ К спискам` очищает рабочее окно.
++7. Управление открытым чатом находится в обычной reply-клавиатуре под полем ввода: `Старее / страница / Новее`, `Инфо / Бан (Разбанить)`, `К спискам`. Эти системные нажатия перехватываются и пользователю не пересылаются.
+ 
+ Системные команды (`/start`, `/menu`, `/back`) пользователю не пересылаются.
+ 
+ ## Уплотнение истории
+ 
+-На восстановленной странице сначала объединяются последовательные текстовые сообщения одного автора в логический блок. Затем соседние **текстовые блоки разных авторов тоже упаковываются в одно Telegram-сообщение**, пока это безопасно по лимиту длины. Каждый автор остаётся визуально отделён своим заголовком, временем и статусом.
++На восстановленной странице сначала объединяются последовательные текстовые сообщения одного автора в логический блок. Затем соседние **текстовые блоки разных авторов тоже упаковываются в одно Telegram-сообщение**, пока готовый видимый текст после разбора HTML укладывается в лимит Telegram 4096 символов. Каждый автор остаётся визуально отделён своим заголовком и временем. Искусственных порогов 2800/3000/3900 больше нет.
+ 
+ Например, три секции `👤 пользователь → 🛡 Igor → 👤 пользователь` обычно будут одним Telegram-сообщением. Фото всегда отправляется отдельным сообщением и разрывает текстовый пакет. Исходные строки в SQLite при этом не объединяются и не изменяются.
+ 
+diff --git a/SPEC_V2.md b/SPEC_V2.md
+index aa2aedf2e51a330305d78e9dab82e492c0d7a2b3..57d7c5a6c3fc943e7f662c60ed0aa10703533262 100644
+--- a/SPEC_V2.md
++++ b/SPEC_V2.md
+@@ -1,4 +1,4 @@
+-# SPEC V2.1 — persistent support chat
++# SPEC V2.2 — persistent support chat
+ 
+ ## Пользовательская модель
+ 
+@@ -26,10 +26,10 @@
+ - страница 1 — последние 10;
+ - более старые страницы доступны кнопками;
+ - последовательный текст одного автора склеивается в логический render block;
+-- соседние текстовые render blocks, в том числе от разных авторов, упаковываются в одно Telegram-сообщение до безопасного лимита;
+-- внутри упакованного сообщения каждый автор сохраняет отдельный заголовок `👤/🛡`, время и статус;
++- соседние текстовые render blocks, в том числе от разных авторов, упаковываются в одно Telegram-сообщение до реального лимита 4096 видимых символов после разбора HTML;
++- внутри упакованного сообщения каждый автор сохраняет отдельный заголовок `👤/🛡` и время;
+ - фото всегда отдельный render block и разрывает текстовую упаковку;
+-- крупные блоки дополнительно дробятся только из-за лимитов Telegram, без потери исходного текста.
++- крупные блоки дробятся только когда готовый видимый текст с заголовком действительно превышает лимит Telegram; исходное Telegram-сообщение не режется по внутренним порогам 2800/3000/3900.
+ 
+ ## Переключение чатов
+ 
+@@ -75,14 +75,11 @@ Debounce = 10 секунд после последнего сообщения п
+ 
+ ## Статус ответа
+ 
+-Telegram Bot API не даёт обычному боту достоверный read receipt пользователя.
++Telegram Bot API не даёт обычному боту достоверный read receipt пользователя. В UI не показываем псевдо-статусы доставки/прочтения и не выводим маркер `после этого пользователь ответил`.
+ 
+-Поэтому показываем:
++## Управление открытым чатом
+ 
+-- `✓ отправлено`;
+-- `↩️ после этого пользователь ответил`.
+-
+-Не использовать слово `прочитано`, если Telegram не дал такого факта.
++`Бан/Разбанить`, `Инфо`, `К спискам`, индикатор страницы и листание истории находятся в persistent reply keyboard. Тексты этих кнопок являются системными командами модераторского UI и никогда не пересылаются пользователю. Подтверждение бана также выполняется reply-кнопками.
+ 
+ ## Бан
+ 
+diff --git a/VALIDATION.md b/VALIDATION.md
+index c7bdb9a7da2801ea7af0a433d8cc7f907019aa03..ed0e5148b49b87336955ae495a4da6c75376c860 100644
+--- a/VALIDATION.md
++++ b/VALIDATION.md
+@@ -1,4 +1,4 @@
+-# VALIDATION — Telegram Support Chat v2.1
++# VALIDATION — Telegram Support Chat v2.2
+ 
+ Дата проверки: 2026-08-09.
+ 
+@@ -8,20 +8,21 @@
+ 
+ ```text
+ pytest -q
+-............                                                             [100%]
+-12 passed
++...............s                                                         [100%]
++15 passed, 1 skipped
+ ```
+ 
+-Тестами покрыты ключевые чистые правила v2:
++В этой сборочной среде `aiogram` недоступен, поэтому отдельный тест фактического объекта `ReplyKeyboardMarkup` пропущен через `pytest.importorskip`. Остальные 15 тестов проходят и покрывают:
+ 
+-- классификация `Новые / Активные / Старые / Мои`;
++- классификацию `Новые / Активные / Старые / Мои`;
+ - `Мои` = активный чат + текущий модератор уже отвечал;
+-- группировка последовательного текста;
+-- фото разрывает текстовую группу и остаётся отдельным блоком;
+-- логические сообщения разных авторов остаются раздельными секциями, но могут быть упакованы в одно Telegram-сообщение;
+-- упаковка нескольких секций соблюдает безопасный лимит 3900 символов;
+-- безопасное дробление длинного текста с учётом HTML escaping;
+-- дефолтная страница истории = 10 исходных сообщений;
++- группировку последовательного текста и разрыв групп фото;
++- отсутствие искусственного разрезания длинного source message на 2800/3000 символов;
++- упаковку секций разных авторов в одно Telegram-сообщение;
++- подсчёт лимита по видимому тексту после HTML entities, а не по длине строки с тегами/`&amp;`;
++- отсутствие `↩️ после этого пользователь ответил` и `✓ отправлено` в истории;
++- отсутствие inline history-controls в рендере;
++- дефолтную страницу истории = 10 исходных сообщений;
+ - создание всех таблиц новой схемы SQLAlchemy.
+ 
+ ### Python compile check
+@@ -67,11 +68,13 @@ BOT_TOKEN='123456:TESTTOKEN' MODERATORS_JSON='{"1":"Test"}' \
+ - `deleteMessage`/`deleteMessages` позволяют удалять сообщения рабочего окна в личном чате в пределах ограничений Telegram;
+ - обычное удаление ограничено возрастом сообщения, поэтому workspace TTL установлен в 23 часа;
+ - callback queries всегда получают `answer()`;
+-- обычный Bot API не используется для выдуманного read receipt: UI показывает только `✓ отправлено` и факт более позднего ответа пользователя.
++- обычный Bot API не используется для выдуманного read receipt: v2.2 вообще не рисует delivery/read proxy markers;
++- `sendMessage.text` допускает 1–4096 символов после entity parsing, поэтому история пакуется по видимой длине;
++- reply controls реализованы через `ReplyKeyboardMarkup` (`is_persistent`, `resize_keyboard`, `input_field_placeholder`).
+ 
+ ## Ограничение этой среды
+ 
+-Полный runtime-smoke-test с настоящим `aiogram` в текущем sandbox выполнить нельзя: внутренний Python package mirror не содержит `aiogram`, а прямой доступ pip к PyPI из runtime-контейнера блокируется DNS/сетью. Попытка создать чистый venv и установить закреплённый `aiogram==3.30.0` остановилась именно на отсутствии пакета в доступном mirror.
++Полный runtime-smoke-test с настоящим Telegram stack в текущем sandbox выполнить нельзя: системное окружение не содержит `aiogram` и `aiosqlite`, а доступный package mirror не отдаёт `aiogram==3.30.0`. Поэтому Telegram polling и async SQLite engine здесь не запускаются. При этом sync schema-test из pytest проходит, а схема БД в v2.2 не менялась.
+ 
+ Это означает, что здесь **не заявляется** полноценный запуск polling против Telegram. Исходники, тестируемая доменная/DB-логика, Alembic DDL и Python syntax проверены; использованные aiogram API сверены с актуальной документацией.
+ 
+@@ -98,5 +101,6 @@ python -m app.main
+ 4. второй отвечает — пользователь видит его отдельный псевдоним;
+ 5. переключение чата удаляет временную историю и открывает новую;
+ 6. возврат восстанавливает последние 10 source messages из SQLite;
+-7. переход по страницам показывает более старую историю; текстовые секции разных авторов на странице упаковываются вместе до лимита, фото остаются отдельно;
+-8. бан блокирует новые пользовательские сообщения, разбан возвращает доступ.
++7. переход по страницам выполняется reply-кнопками; текстовые секции разных авторов на странице упаковываются вместе до реального лимита 4096 видимых символов, фото остаются отдельно;
++8. `Инфо`, `Бан/Разбанить`, `К спискам` и навигация находятся в reply keyboard и не пересылаются пользователю;
++9. бан блокирует новые пользовательские сообщения, разбан возвращает доступ.
+diff --git a/app/domain/rendering.py b/app/domain/rendering.py
+index 925cbda602cf67dae60cfe0cb20f8796a512a649..92e5940a4cf3e94a6206bc11b3e64b0baf26817e 100644
+--- a/app/domain/rendering.py
++++ b/app/domain/rendering.py
+@@ -31,36 +31,13 @@ class RenderBlock:
+     source_message_ids: tuple[int, ...]
+ 
+ 
+-MAX_GROUP_TEXT = 3000
+-
+-
+-def _split_text(text: str, limit: int = MAX_GROUP_TEXT) -> list[str]:
+-    if len(text) <= limit:
+-        return [text]
+-    chunks: list[str] = []
+-    current = ""
+-    for part in text.split("\n"):
+-        candidate = part if not current else f"{current}\n{part}"
+-        if len(candidate) <= limit:
+-            current = candidate
+-            continue
+-        if current:
+-            chunks.append(current)
+-            current = ""
+-        while len(part) > limit:
+-            chunks.append(part[:limit])
+-            part = part[limit:]
+-        current = part
+-    if current:
+-        chunks.append(current)
+-    return chunks or [""]
+-
+-
+ def group_history(messages: Iterable[MessageLike]) -> list[RenderBlock]:
+-    """Group only consecutive text messages from the same logical author.
++    """Group consecutive text messages from the same logical author.
+ 
+-    Photos are always standalone. Large text groups are split so Telegram HTML
+-    wrappers and headers still fit well below the 4096-character text limit.
++    We deliberately do not split by an artificial internal character limit.
++    Telegram-sized splitting happens later, after the visible header is known,
++    so a long source message remains whole whenever it actually fits Bot API's
++    text limit. Photos are always standalone and break a text group.
+     """
+     result: list[RenderBlock] = []
+     pending: list[MessageLike] = []
+@@ -69,23 +46,19 @@ def group_history(messages: Iterable[MessageLike]) -> list[RenderBlock]:
+         nonlocal pending
+         if not pending:
+             return
+-        joined = "\n".join((m.text or "") for m in pending)
+-        chunks = _split_text(joined)
+-        ids = tuple(m.id for m in pending)
+-        for chunk in chunks:
+-            result.append(
+-                RenderBlock(
+-                    sender_type=pending[0].sender_type,
+-                    sender_telegram_id=pending[0].sender_telegram_id,
+-                    sender_alias=pending[0].sender_alias,
+-                    kind=MessageKind.TEXT.value,
+-                    text=chunk,
+-                    photo_file_id=None,
+-                    first_created_at=pending[0].created_at,
+-                    last_created_at=pending[-1].created_at,
+-                    source_message_ids=ids,
+-                )
++        result.append(
++            RenderBlock(
++                sender_type=pending[0].sender_type,
++                sender_telegram_id=pending[0].sender_telegram_id,
++                sender_alias=pending[0].sender_alias,
++                kind=MessageKind.TEXT.value,
++                text="\n".join((m.text or "") for m in pending),
++                photo_file_id=None,
++                first_created_at=pending[0].created_at,
++                last_created_at=pending[-1].created_at,
++                source_message_ids=tuple(m.id for m in pending),
+             )
++        )
+         pending = []
+ 
+     for message in messages:
+diff --git a/app/handlers/common.py b/app/handlers/common.py
+index 8e9bc75aecaca75ff660aeea9f5fec6a3f9a2b75..8a5301a6d3d2efd8d9fd0871cb215ae6c9ea7d57 100644
+--- a/app/handlers/common.py
++++ b/app/handlers/common.py
+@@ -1,6 +1,6 @@
+ from aiogram import Router
+ from aiogram.filters import CommandStart
+-from aiogram.types import Message
++from aiogram.types import Message, ReplyKeyboardRemove
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from app.config import Settings
+@@ -24,9 +24,10 @@ async def start(
+     telegram_id = message.from_user.id
+     if telegram_id in settings.moderators:
+         await view_service.close_chat(telegram_id)
++        await message.answer("Панель модератора.", reply_markup=ReplyKeyboardRemove())
+         await message.answer(
+-            "Панель поддержки. Откройте любой диалог; закреплений нет — "
+-            "несколько модераторов могут отвечать одновременно.",
++            "Откройте любой диалог; закреплений нет — несколько модераторов "
++            "могут отвечать одновременно.",
+             reply_markup=main_menu_keyboard(),
+         )
+         return
+diff --git a/app/handlers/moderator.py b/app/handlers/moderator.py
+index 74ede66cf779cfdfb01e0d8c4a178604ea01962d..806174b92af508929dc4add2c8f188217a6d2721 100644
+--- a/app/handlers/moderator.py
++++ b/app/handlers/moderator.py
+@@ -5,7 +5,7 @@ from datetime import datetime
+ from aiogram import Bot, F, Router
+ from aiogram.exceptions import TelegramAPIError
+ from aiogram.filters import Command
+-from aiogram.types import CallbackQuery, Message
++from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from app.config import Settings
+@@ -13,7 +13,16 @@ from app.db.models import User
+ from app.domain.enums import ChatBucket, MessageKind
+ from app.filters import IsModerator
+ from app.keyboards.moderator import (
++    BTN_BACK,
++    BTN_BAN,
++    BTN_CANCEL,
++    BTN_CONFIRM_BAN,
++    BTN_INFO,
++    BTN_NEWER,
++    BTN_OLDER,
++    BTN_UNBAN,
+     BUCKET_TITLES,
++    PAGE_PREFIX,
+     chat_list_keyboard,
+     confirm_ban_keyboard,
+     main_menu_keyboard,
+@@ -21,8 +30,8 @@ from app.keyboards.moderator import (
+ from app.services.chats import ChatService
+ from app.services.views import ViewService, display_user_name
+ from app.utils.html import h, short
++from app.utils.text import TELEGRAM_CAPTION_LIMIT, TELEGRAM_TEXT_LIMIT, split_plain_text
+ from app.utils.time import aware_utc
+-from app.utils.text import split_for_html
+ 
+ router = Router(name="moderator")
+ 
+@@ -32,6 +41,13 @@ def _fmt_dt(value: datetime | None) -> str:
+     return value.strftime("%d.%m.%Y %H:%M UTC") if value else "—"
+ 
+ 
++async def _delete_input(message: Message) -> None:
++    try:
++        await message.delete()
++    except TelegramAPIError:
++        pass
++
++
+ async def _workspace_notice(
+     message: Message,
+     view_service: ViewService,
+@@ -48,13 +64,53 @@ async def _workspace_notice(
+ async def _show_main_menu_message(message: Message, view_service: ViewService) -> None:
+     if message.from_user is None:
+         return
+-    await view_service.close_chat(message.from_user.id)
++    moderator_id = message.from_user.id
++    await _delete_input(message)
++    await view_service.close_chat(moderator_id)
++    # A reply keyboard and an inline keyboard cannot be attached to the same
++    # Telegram message, so remove the chat controls first, then show lists.
++    await message.answer("Диалог скрыт.", reply_markup=ReplyKeyboardRemove())
+     await message.answer(
+         "Панель поддержки. Выберите список диалогов.",
+         reply_markup=main_menu_keyboard(),
+     )
+ 
+ 
++async def _send_active_info(
++    *,
++    moderator_id: int,
++    bot: Bot,
++    db: AsyncSession,
++    settings: Settings,
++    chat_service: ChatService,
++    view_service: ViewService,
++) -> None:
++    user_id, _, _ = await view_service.get_active(moderator_id)
++    if user_id is None:
++        await bot.send_message(moderator_id, "Сначала откройте диалог через /menu.")
++        return
++    info = await chat_service.user_info(db, user_id=user_id)
++    if info is None:
++        return
++    user = info.user
++    participants = [settings.moderators.get(mid, str(mid)) for mid in info.moderator_ids]
++    participants_text = short(", ".join(participants), 300) if participants else ""
++    text = (
++        f"ℹ️ <b>{h(short(display_user_name(user), 80))}</b>\n"
++        f"ID: <code>{user.telegram_id}</code>\n"
++        f"Username: {h('@' + user.username) if user.username else '—'}\n"
++        f"Первое обращение: {_fmt_dt(user.created_at)}\n"
++        f"Последнее сообщение пользователя: {_fmt_dt(user.last_user_message_at)}\n"
++        f"Последний ответ поддержки: {_fmt_dt(user.last_support_message_at)}\n"
++        f"Сообщений: <b>{info.message_count}</b> "
++        f"(пользователь {info.user_message_count}, поддержка {info.support_message_count})\n"
++        f"Отвечали: {h(participants_text) if participants_text else 'никто'}\n"
++        f"Бан: <b>{'да' if user.is_banned else 'нет'}</b>"
++    )
++    sent = await bot.send_message(moderator_id, text)
++    await view_service.track_existing_message(moderator_id, user_id, sent.message_id)
++
++
+ @router.message(IsModerator(), Command("menu"))
+ @router.message(IsModerator(), Command("back"))
+ async def moderator_menu_command(message: Message, view_service: ViewService) -> None:
+@@ -149,8 +205,6 @@ async def open_chat(
+     except ValueError:
+         return
+ 
+-    # List/notification messages are outside the temporary workspace, so remove
+-    # the message that was used to enter the virtual chat.
+     if callback.message:
+         try:
+             await callback.message.delete()
+@@ -161,8 +215,12 @@ async def open_chat(
+         await bot.send_message(callback.from_user.id, "Диалог не найден.")
+ 
+ 
++# Legacy callbacks are intentionally kept for already-rendered v2.1 workspaces.
++# v2.2 no longer creates inline chat controls.
+ @router.callback_query(IsModerator(), F.data.startswith("chat:page:"))
+-async def change_history_page(callback: CallbackQuery, view_service: ViewService) -> None:
++async def legacy_change_history_page(
++    callback: CallbackQuery, view_service: ViewService
++) -> None:
+     await callback.answer()
+     if callback.from_user is None or callback.data is None:
+         return
+@@ -178,7 +236,7 @@ async def change_history_page(callback: CallbackQuery, view_service: ViewService
+ 
+ 
+ @router.callback_query(IsModerator(), F.data == "chat:back")
+-async def leave_chat(
++async def legacy_leave_chat(
+     callback: CallbackQuery, bot: Bot, view_service: ViewService
+ ) -> None:
+     await callback.answer()
+@@ -193,7 +251,7 @@ async def leave_chat(
+ 
+ 
+ @router.callback_query(IsModerator(), F.data.startswith("chat:info:"))
+-async def chat_info(
++async def legacy_chat_info(
+     callback: CallbackQuery,
+     bot: Bot,
+     db: AsyncSession,
+@@ -202,108 +260,155 @@ async def chat_info(
+     view_service: ViewService,
+ ) -> None:
+     await callback.answer()
+-    if callback.from_user is None or callback.data is None:
++    if callback.from_user is None:
+         return
+-    try:
+-        user_id = int(callback.data.rsplit(":", 1)[1])
+-    except ValueError:
++    await _send_active_info(
++        moderator_id=callback.from_user.id,
++        bot=bot,
++        db=db,
++        settings=settings,
++        chat_service=chat_service,
++        view_service=view_service,
++    )
++
++
++@router.callback_query(IsModerator(), F.data == "noop")
++async def noop(callback: CallbackQuery) -> None:
++    await callback.answer()
++
++
++# --- Reply-keyboard controls inside an open chat ---
++
++
++@router.message(IsModerator(), F.text == BTN_BACK)
++async def reply_back(message: Message, view_service: ViewService) -> None:
++    await _show_main_menu_message(message, view_service)
++
++
++@router.message(IsModerator(), F.text == BTN_OLDER)
++async def reply_older(message: Message, view_service: ViewService) -> None:
++    if message.from_user is None:
+         return
+-    info = await chat_service.user_info(db, user_id=user_id)
+-    if info is None:
++    moderator_id = message.from_user.id
++    user_id, page, _ = await view_service.get_active(moderator_id)
++    await _delete_input(message)
++    if user_id is not None:
++        await view_service.open_chat(moderator_id, user_id, page + 1)
++
++
++@router.message(IsModerator(), F.text == BTN_NEWER)
++async def reply_newer(message: Message, view_service: ViewService) -> None:
++    if message.from_user is None:
+         return
+-    user = info.user
+-    participants = [settings.moderators.get(mid, str(mid)) for mid in info.moderator_ids]
+-    participants_text = short(", ".join(participants), 300) if participants else ""
+-    text = (
+-        f"ℹ️ <b>{h(short(display_user_name(user), 80))}</b>\n"
+-        f"ID: <code>{user.telegram_id}</code>\n"
+-        f"Username: {h('@' + user.username) if user.username else '—'}\n"
+-        f"Первое обращение: {_fmt_dt(user.created_at)}\n"
+-        f"Последнее сообщение пользователя: {_fmt_dt(user.last_user_message_at)}\n"
+-        f"Последний ответ поддержки: {_fmt_dt(user.last_support_message_at)}\n"
+-        f"Сообщений: <b>{info.message_count}</b> "
+-        f"(пользователь {info.user_message_count}, поддержка {info.support_message_count})\n"
+-        f"Отвечали: {h(participants_text) if participants_text else 'никто'}\n"
+-        f"Бан: <b>{'да' if user.is_banned else 'нет'}</b>"
+-    )
+-    sent = await bot.send_message(callback.from_user.id, text)
+-    await view_service.track_existing_message(callback.from_user.id, user_id, sent.message_id)
++    moderator_id = message.from_user.id
++    user_id, page, _ = await view_service.get_active(moderator_id)
++    await _delete_input(message)
++    if user_id is not None:
++        await view_service.open_chat(moderator_id, user_id, max(0, page - 1))
+ 
+ 
+-@router.callback_query(IsModerator(), F.data.startswith("chat:ban:"))
+-async def ask_ban(
+-    callback: CallbackQuery, bot: Bot, view_service: ViewService
++@router.message(IsModerator(), F.text.startswith(PAGE_PREFIX))
++async def reply_page_indicator(message: Message) -> None:
++    # Reply keyboards cannot contain a truly inert label. Treat a tap on the
++    # visible page counter as a system action and never forward it to the user.
++    await _delete_input(message)
++
++
++@router.message(IsModerator(), F.text == BTN_INFO)
++async def reply_info(
++    message: Message,
++    bot: Bot,
++    db: AsyncSession,
++    settings: Settings,
++    chat_service: ChatService,
++    view_service: ViewService,
+ ) -> None:
+-    await callback.answer()
+-    if callback.from_user is None or callback.data is None:
++    if message.from_user is None:
+         return
+-    try:
+-        user_id = int(callback.data.rsplit(":", 1)[1])
+-    except ValueError:
++    await _delete_input(message)
++    await _send_active_info(
++        moderator_id=message.from_user.id,
++        bot=bot,
++        db=db,
++        settings=settings,
++        chat_service=chat_service,
++        view_service=view_service,
++    )
++
++
++@router.message(IsModerator(), F.text == BTN_BAN)
++async def reply_ask_ban(message: Message, view_service: ViewService) -> None:
++    if message.from_user is None:
+         return
+-    sent = await bot.send_message(
+-        callback.from_user.id,
++    moderator_id = message.from_user.id
++    user_id, _, _ = await view_service.get_active(moderator_id)
++    await _delete_input(message)
++    if user_id is None:
++        return
++    sent = await message.answer(
+         "Заблокировать пользователю доступ к поддержке бессрочно?",
+-        reply_markup=confirm_ban_keyboard(user_id),
++        reply_markup=confirm_ban_keyboard(),
+     )
+-    await view_service.track_existing_message(callback.from_user.id, user_id, sent.message_id)
++    await view_service.track_existing_message(moderator_id, user_id, sent.message_id)
+ 
+ 
+-@router.callback_query(IsModerator(), F.data.startswith("chat:ban_yes:"))
+-async def confirm_ban(
+-    callback: CallbackQuery,
++@router.message(IsModerator(), F.text == BTN_CONFIRM_BAN)
++async def reply_confirm_ban(
++    message: Message,
+     db: AsyncSession,
+     chat_service: ChatService,
+     view_service: ViewService,
+ ) -> None:
+-    if callback.from_user is None or callback.data is None:
++    if message.from_user is None:
+         return
+-    try:
+-        user_id = int(callback.data.rsplit(":", 1)[1])
+-    except ValueError:
++    moderator_id = message.from_user.id
++    user_id, page, _ = await view_service.get_active(moderator_id)
++    await _delete_input(message)
++    if user_id is None:
+         return
+-    ok = await chat_service.set_ban(
++    await chat_service.set_ban(
+         db,
+-        actor_id=callback.from_user.id,
++        actor_id=moderator_id,
+         user_id=user_id,
+         banned=True,
+     )
+     await db.commit()
+-    await callback.answer("Пользователь заблокирован." if ok else "Пользователь не найден.")
+-    active_user, page, _ = await view_service.get_active(callback.from_user.id)
+-    if active_user == user_id:
+-        await view_service.open_chat(callback.from_user.id, user_id, page)
++    await view_service.open_chat(moderator_id, user_id, page)
+ 
+ 
+-@router.callback_query(IsModerator(), F.data.startswith("chat:unban:"))
+-async def unban(
+-    callback: CallbackQuery,
++@router.message(IsModerator(), F.text == BTN_UNBAN)
++async def reply_unban(
++    message: Message,
+     db: AsyncSession,
+     chat_service: ChatService,
+     view_service: ViewService,
+ ) -> None:
+-    if callback.from_user is None or callback.data is None:
++    if message.from_user is None:
+         return
+-    try:
+-        user_id = int(callback.data.rsplit(":", 1)[1])
+-    except ValueError:
++    moderator_id = message.from_user.id
++    user_id, page, _ = await view_service.get_active(moderator_id)
++    await _delete_input(message)
++    if user_id is None:
+         return
+-    ok = await chat_service.set_ban(
++    await chat_service.set_ban(
+         db,
+-        actor_id=callback.from_user.id,
++        actor_id=moderator_id,
+         user_id=user_id,
+         banned=False,
+     )
+     await db.commit()
+-    await callback.answer("Пользователь разблокирован." if ok else "Пользователь не найден.")
+-    active_user, page, _ = await view_service.get_active(callback.from_user.id)
+-    if active_user == user_id:
+-        await view_service.open_chat(callback.from_user.id, user_id, page)
++    await view_service.open_chat(moderator_id, user_id, page)
+ 
+ 
+-@router.callback_query(IsModerator(), F.data == "noop")
+-async def noop(callback: CallbackQuery) -> None:
+-    await callback.answer()
++@router.message(IsModerator(), F.text == BTN_CANCEL)
++async def reply_cancel(message: Message, view_service: ViewService) -> None:
++    if message.from_user is None:
++        return
++    moderator_id = message.from_user.id
++    user_id, page, _ = await view_service.get_active(moderator_id)
++    await _delete_input(message)
++    if user_id is not None:
++        await view_service.open_chat(moderator_id, user_id, page)
+ 
+ 
+ @router.message(IsModerator(), F.text.startswith("/"))
+@@ -343,7 +448,7 @@ async def moderator_chat_message(
+             view_service,
+             moderator_id=moderator_id,
+             user_id=user_id,
+-            text="Пользователь заблокирован. Сначала разбаньте его через «Инфо».",
++            text="Пользователь заблокирован. Сначала разбаньте его кнопкой «Разбанить».",
+         )
+         return
+ 
+@@ -367,23 +472,31 @@ async def moderator_chat_message(
+ 
+     alias = settings.moderators[moderator_id]
+     try:
+-        user_header = f"<b>🛡 {h(short(alias, 80))}</b>"
++        label = f"🛡 {short(alias, 80)}"
++        user_header = f"<b>{h(label)}</b>"
+         if kind == MessageKind.TEXT.value:
+-            for chunk in split_for_html(text, 3300):
++            room = max(1, TELEGRAM_TEXT_LIMIT - len(label) - 1)
++            for chunk in split_plain_text(text, room):
+                 await bot.send_message(
+                     chat_id=user_id,
+                     text=f"{user_header}\n{h(chunk)}",
+                 )
+         else:
+-            caption_chunks = split_for_html(text, 700) if text else []
+-            first_caption = caption_chunks[0] if caption_chunks else ""
++            full_caption = text or ""
++            caption_room = max(1, TELEGRAM_CAPTION_LIMIT - len(label) - 1)
++            first_caption = full_caption[:caption_room]
++            remaining = full_caption[caption_room:]
+             caption = user_header + (f"\n{h(first_caption)}" if first_caption else "")
+             await bot.send_photo(chat_id=user_id, photo=photo_file_id, caption=caption)
+-            for chunk in caption_chunks[1:]:
+-                await bot.send_message(
+-                    chat_id=user_id,
+-                    text=f"{user_header} · <i>подпись к фото</i>\n{h(chunk)}",
+-                )
++            if remaining:
++                continuation_label = f"{label} · подпись к фото"
++                continuation_header = f"{user_header} · <i>подпись к фото</i>"
++                room = max(1, TELEGRAM_TEXT_LIMIT - len(continuation_label) - 1)
++                for chunk in split_plain_text(remaining, room):
++                    await bot.send_message(
++                        chat_id=user_id,
++                        text=f"{continuation_header}\n{h(chunk)}",
++                    )
+     except TelegramAPIError:
+         await _workspace_notice(
+             message,
+@@ -404,8 +517,6 @@ async def moderator_chat_message(
+         photo_file_id=photo_file_id,
+         telegram_message_id=message.message_id,
+     )
+-    # Release SQLite's write lock before ViewService records its temporary
+-    # workspace messages through a separate short-lived session.
+     await db.commit()
+ 
+     try:
+diff --git a/app/keyboards/moderator.py b/app/keyboards/moderator.py
+index 84ff0f8be00f1930ae25907987a172a9d56c783e..6c83c3fe240ff81ca7c128271aaf7af53cd394b6 100644
+--- a/app/keyboards/moderator.py
++++ b/app/keyboards/moderator.py
+@@ -1,4 +1,9 @@
+-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
++from aiogram.types import (
++    InlineKeyboardButton,
++    InlineKeyboardMarkup,
++    KeyboardButton,
++    ReplyKeyboardMarkup,
++)
+ 
+ from app.domain.enums import ChatBucket
+ 
+@@ -10,6 +15,16 @@ BUCKET_TITLES = {
+     ChatBucket.OLD: "🗄 Старые",
+ }
+ 
++BTN_OLDER = "⬅️ Старее"
++BTN_NEWER = "Новее ➡️"
++BTN_INFO = "ℹ️ Инфо"
++BTN_BAN = "🚫 Бан"
++BTN_UNBAN = "✅ Разбанить"
++BTN_BACK = "◀️ К спискам"
++BTN_CONFIRM_BAN = "⚠️ Подтвердить бан"
++BTN_CANCEL = "Отмена"
++PAGE_PREFIX = "📄 "
++
+ 
+ def main_menu_keyboard() -> InlineKeyboardMarkup:
+     return InlineKeyboardMarkup(
+@@ -48,50 +63,44 @@ def chat_list_keyboard(
+     return InlineKeyboardMarkup(inline_keyboard=rows)
+ 
+ 
+-def history_controls(
+-    *, user_id: int, page: int, pages: int, banned: bool
+-) -> InlineKeyboardMarkup:
+-    nav: list[InlineKeyboardButton] = []
++def chat_controls_keyboard(*, page: int, pages: int, banned: bool) -> ReplyKeyboardMarkup:
++    nav: list[KeyboardButton] = []
+     if page + 1 < pages:
+-        nav.append(
+-            InlineKeyboardButton(text="⬅️ Старее", callback_data=f"chat:page:{user_id}:{page + 1}")
+-        )
+-    nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="noop"))
++        nav.append(KeyboardButton(text=BTN_OLDER))
++    nav.append(KeyboardButton(text=f"{PAGE_PREFIX}{page + 1}/{pages}"))
+     if page > 0:
+-        nav.append(
+-            InlineKeyboardButton(text="Новее ➡️", callback_data=f"chat:page:{user_id}:{page - 1}")
+-        )
++        nav.append(KeyboardButton(text=BTN_NEWER))
+ 
+-    ban_button = InlineKeyboardButton(
+-        text="✅ Разбанить" if banned else "🚫 Бан",
+-        callback_data=f"chat:{'unban' if banned else 'ban'}:{user_id}",
+-    )
+-    return InlineKeyboardMarkup(
+-        inline_keyboard=[
++    return ReplyKeyboardMarkup(
++        keyboard=[
+             nav,
+             [
+-                InlineKeyboardButton(text="ℹ️ Инфо", callback_data=f"chat:info:{user_id}"),
+-                ban_button,
++                KeyboardButton(text=BTN_INFO),
++                KeyboardButton(text=BTN_UNBAN if banned else BTN_BAN),
+             ],
+-            [InlineKeyboardButton(text="◀️ К спискам", callback_data="chat:back")],
+-        ]
++            [KeyboardButton(text=BTN_BACK)],
++        ],
++        resize_keyboard=True,
++        is_persistent=True,
++        input_field_placeholder="Сообщение пользователю…",
+     )
+ 
+ 
+-def open_chat_keyboard(user_id: int) -> InlineKeyboardMarkup:
+-    return InlineKeyboardMarkup(
+-        inline_keyboard=[
+-            [InlineKeyboardButton(text="Открыть диалог", callback_data=f"chat:open:{user_id}:0")]
+-        ]
++def confirm_ban_keyboard() -> ReplyKeyboardMarkup:
++    return ReplyKeyboardMarkup(
++        keyboard=[
++            [KeyboardButton(text=BTN_CONFIRM_BAN), KeyboardButton(text=BTN_CANCEL)],
++            [KeyboardButton(text=BTN_BACK)],
++        ],
++        resize_keyboard=True,
++        is_persistent=True,
++        input_field_placeholder="Подтвердите действие",
+     )
+ 
+ 
+-def confirm_ban_keyboard(user_id: int) -> InlineKeyboardMarkup:
++def open_chat_keyboard(user_id: int) -> InlineKeyboardMarkup:
+     return InlineKeyboardMarkup(
+         inline_keyboard=[
+-            [
+-                InlineKeyboardButton(text="🚫 Забанить", callback_data=f"chat:ban_yes:{user_id}"),
+-                InlineKeyboardButton(text="Отмена", callback_data=f"chat:info:{user_id}"),
+-            ]
++            [InlineKeyboardButton(text="Открыть диалог", callback_data=f"chat:open:{user_id}:0")]
+         ]
+     )
+diff --git a/app/services/views.py b/app/services/views.py
+index 01378270efc7821d9088dad3003fc0681a4865df..c9f3f78fe866948ec97c56aceba8468eb5ad762c 100644
+--- a/app/services/views.py
++++ b/app/services/views.py
+@@ -11,12 +11,17 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+ 
+ from app.config import Settings
+ from app.db.models import ModeratorSession, ModeratorViewMessage, SupportMessage, User
+-from app.domain.enums import MessageKind, SenderType
++from app.domain.enums import MessageKind
+ from app.domain.rendering import RenderBlock, group_history, sender_label
+-from app.keyboards.moderator import history_controls
++from app.keyboards.moderator import chat_controls_keyboard
+ from app.services.chats import ChatService, HistoryPage
+ from app.utils.html import h, short
+-from app.utils.text import TEXT_PACK_LIMIT, pack_html_sections, split_for_html
++from app.utils.text import (
++    TELEGRAM_CAPTION_LIMIT,
++    TELEGRAM_TEXT_LIMIT,
++    pack_html_sections,
++    split_plain_text,
++)
+ from app.utils.time import aware_utc, utcnow
+ 
+ logger = logging.getLogger(__name__)
+@@ -164,26 +169,14 @@ class ViewService:
+                 session.last_activity_at = utcnow()
+                 await db.commit()
+ 
+-    def _delivery_status(self, block: RenderBlock, user: User) -> str:
+-        if block.sender_type != SenderType.MODERATOR.value:
+-            return ""
+-        last_user = aware_utc(user.last_user_message_at)
+-        block_time = aware_utc(block.last_created_at)
+-        if last_user is not None and block_time is not None and last_user > block_time:
+-            return "\n<i>↩️ после этого пользователь ответил</i>"
+-        return "\n<i>✓ отправлено</i>"
+-
+     def _text_sections(self, user: User, block: RenderBlock) -> list[str]:
+         label = short(sender_label(block, display_user_name(user)), 80)
+-        status = self._delivery_status(block, user)
+         time_part = _time_label(block)
+         header = f"<b>{h(label)}</b> · <i>{time_part}</i>"
+-        chunks = split_for_html(block.text, 2800)
+-        sections: list[str] = []
+-        for index, chunk in enumerate(chunks):
+-            suffix = status if index == len(chunks) - 1 else ""
+-            sections.append(f"{header}\n<blockquote>{h(chunk)}</blockquote>{suffix}")
+-        return sections
++        visible_header = f"{label} · {time_part}\n"
++        max_content = max(1, TELEGRAM_TEXT_LIMIT - len(visible_header))
++        chunks = split_plain_text(block.text, max_content)
++        return [f"{header}\n<blockquote>{h(chunk)}</blockquote>" for chunk in chunks]
+ 
+     async def _send_text_run(
+         self, moderator_id: int, user: User, blocks: list[RenderBlock]
+@@ -204,30 +197,35 @@ class ViewService:
+             return await self._send_text_run(moderator_id, user, [block])
+ 
+         label = short(sender_label(block, display_user_name(user)), 80)
+-        status = self._delivery_status(block, user)
+         time_part = _time_label(block)
+         header = f"<b>{h(label)}</b> · <i>{time_part}</i>"
+-        caption_chunks = split_for_html(block.text, 700) if block.text else []
+-        first_caption = caption_chunks[0] if caption_chunks else ""
+-        has_continuation = len(caption_chunks) > 1
+-        caption = header
+-        if first_caption:
+-            caption += f"\n{h(first_caption)}"
+-        if not has_continuation:
+-            caption += status
++        visible_header = f"{label} · {time_part}"
++        caption_room = max(1, TELEGRAM_CAPTION_LIMIT - len(visible_header) - 1)
++        full_caption = block.text or ""
++        first_caption = full_caption[:caption_room]
++        remaining = full_caption[caption_room:]
++        caption = header + (f"\n{h(first_caption)}" if first_caption else "")
+         sent_photo = await self.bot.send_photo(
+             chat_id=moderator_id,
+             photo=block.photo_file_id,
+             caption=caption,
+         )
+         ids = [sent_photo.message_id]
+-        for index, chunk in enumerate(caption_chunks[1:], start=1):
+-            suffix = status if index == len(caption_chunks) - 1 else ""
+-            sent = await self.bot.send_message(
+-                chat_id=moderator_id,
+-                text=f"{header} · <i>подпись</i>\n<blockquote>{h(chunk)}</blockquote>{suffix}",
++        if remaining:
++            continuation_header = f"{header} · <i>подпись</i>"
++            visible_continuation_header = f"{label} · {time_part} · подпись\n"
++            continuation_room = max(
++                1, TELEGRAM_TEXT_LIMIT - len(visible_continuation_header)
+             )
+-            ids.append(sent.message_id)
++            for chunk in split_plain_text(remaining, continuation_room):
++                sent = await self.bot.send_message(
++                    chat_id=moderator_id,
++                    text=(
++                        f"{continuation_header}\n"
++                        f"<blockquote>{h(chunk)}</blockquote>"
++                    ),
++                )
++                ids.append(sent.message_id)
+         return ids
+ 
+     async def _render_page(self, moderator_id: int, history: HistoryPage) -> None:
+@@ -242,6 +240,11 @@ class ViewService:
+                 f"<code>{user.telegram_id}</code> · {h(username)} · {state}\n"
+                 "Любой обычный текст или фото сейчас уйдёт этому пользователю."
+             ),
++            reply_markup=chat_controls_keyboard(
++                page=history.page,
++                pages=history.pages,
++                banned=user.is_banned,
++            ),
+         )
+         await self._track(moderator_id, user.telegram_id, header.message_id)
+ 
+@@ -267,21 +270,6 @@ class ViewService:
+                 await self._track(moderator_id, user.telegram_id, message_id)
+         await flush_text_run()
+ 
+-        controls = await self.bot.send_message(
+-            chat_id=moderator_id,
+-            text=(
+-                f"История: <b>{history.total}</b> сообщений · "
+-                f"страница <b>{history.page + 1}/{history.pages}</b> · "
+-                f"по {self.settings.history_page_size} исходных сообщений"
+-            ),
+-            reply_markup=history_controls(
+-                user_id=user.telegram_id,
+-                page=history.page,
+-                pages=history.pages,
+-                banned=user.is_banned,
+-            ),
+-        )
+-        await self._track(moderator_id, user.telegram_id, controls.message_id)
+ 
+     async def open_chat(self, moderator_id: int, user_id: int, page: int = 0) -> bool:
+         async with self._lock_for(moderator_id):
+diff --git a/app/utils/text.py b/app/utils/text.py
+index 2cbc0a3b4f45a48d94bf3248447769a3f954f2ba..e7490706ef5989c16cddb897c6acdc1fbc12fe4b 100644
+--- a/app/utils/text.py
++++ b/app/utils/text.py
+@@ -1,13 +1,19 @@
+ from __future__ import annotations
+ 
+-from html import escape
++import re
++from html import escape, unescape
++
++TELEGRAM_TEXT_LIMIT = 4096
++TELEGRAM_CAPTION_LIMIT = 1024
++_TAG_RE = re.compile(r"<[^>]+>")
++
+ 
+ 
+ def split_for_html(text: str | None, max_escaped_chars: int) -> list[str]:
+-    """Split plain text by the length it will have after HTML escaping.
++    """Compatibility helper for conservative notification/caption paths.
+ 
+-    Returned chunks are still plain text. This makes Telegram length handling
+-    safe even for strings containing many '&', '<' or '>' characters.
++    History rendering no longer uses this function; it works with Telegram's
++    post-entity-parsing visible limit instead.
+     """
+     value = text or ""
+     if not value:
+@@ -28,29 +34,52 @@ def split_for_html(text: str | None, max_escaped_chars: int) -> list[str]:
+         chunks.append("".join(current))
+     return chunks
+ 
++def split_plain_text(text: str | None, max_chars: int) -> list[str]:
++    """Split plain text only when the final Telegram message requires it.
++
++    The input is plain text, so HTML escaping does not reduce the amount of
++    user-visible content that Telegram accepts: Bot API's text limit is applied
++    after entity parsing. We therefore split by visible characters, not by the
++    length of escaped HTML source.
++    """
++    value = text or ""
++    if not value:
++        return [""]
++    return [value[i : i + max_chars] for i in range(0, len(value), max_chars)]
++
++
++def telegram_visible_length(html_text: str) -> int:
++    """Approximate Bot API's post-entity-parsing character count for our HTML.
+ 
+-TEXT_PACK_LIMIT = 3900
++    Rendering code only emits simple Telegram-supported tags, while all user
++    text is escaped first, so stripping tags and unescaping entities yields the
++    visible message text used for the 4096-character limit.
++    """
++    return len(unescape(_TAG_RE.sub("", html_text)))
+ 
+ 
+-def pack_html_sections(sections: list[str], limit: int = TEXT_PACK_LIMIT) -> list[str]:
+-    """Pack already-rendered HTML sections into Telegram text messages.
++def pack_html_sections(sections: list[str], limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
++    """Pack rendered HTML sections up to Telegram's real visible-text limit.
+ 
+-    Sections stay intact, so every author label remains visually separate.
+-    A conservative default ceiling leaves headroom below Telegram's 4096-char
+-    text limit. Callers should make sure each individual section fits `limit`.
++    Different authors may share one Telegram message because every section has
++    its own visible 👤/🛡 header. A section is kept intact when it fits; callers
++    split an individual oversized section before handing it here.
+     """
+     packed: list[str] = []
+     current = ""
++    current_visible = 0
+     for section in sections:
+         if not section:
+             continue
+-        candidate = section if not current else f"{current}\n\n{section}"
+-        if len(candidate) <= limit:
+-            current = candidate
+-            continue
+-        if current:
++        section_visible = telegram_visible_length(section)
++        separator_visible = 2 if current else 0
++        if current and current_visible + separator_visible + section_visible > limit:
+             packed.append(current)
+-        current = section
++            current = section
++            current_visible = section_visible
++            continue
++        current = section if not current else f"{current}\n\n{section}"
++        current_visible += separator_visible + section_visible
+     if current:
+         packed.append(current)
+     return packed
+diff --git a/pyproject.toml b/pyproject.toml
+index 5a02c486b6d704a68be8e155d761574af531bb5b..7e8ebc9dcdb45431f34038f843c5f0a246139f7c 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "telegram-support-chat"
+-version = "2.1.0"
++version = "2.2.0"
+ description = "Persistent Telegram support chat with ephemeral moderator workspaces"
+ requires-python = ">=3.11,<3.15"
+ dependencies = [
+diff --git a/tests/test_keyboards.py b/tests/test_keyboards.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d8eab07efe62a5dd5f3b90cc469d4c5b0a97cd25
+--- /dev/null
++++ b/tests/test_keyboards.py
+@@ -0,0 +1,15 @@
++import pytest
++
++pytest.importorskip("aiogram")
++
++from app.keyboards.moderator import BTN_BACK, BTN_INFO, BTN_OLDER, chat_controls_keyboard
++
++
++def test_chat_controls_are_reply_keyboard() -> None:
++    markup = chat_controls_keyboard(page=0, pages=3, banned=False)
++    texts = [button.text for row in markup.keyboard for button in row]
++    assert BTN_OLDER in texts
++    assert BTN_INFO in texts
++    assert BTN_BACK in texts
++    assert "📄 1/3" in texts
++    assert not hasattr(markup, "inline_keyboard")
+diff --git a/tests/test_rendering.py b/tests/test_rendering.py
+index 5ae72d6f65c6b565a1ed45a0f08118e20c3a596f..20a26178d08c2c653c2a607d86d4d0d16ae95d45 100644
+--- a/tests/test_rendering.py
++++ b/tests/test_rendering.py
+@@ -1,9 +1,16 @@
+ from dataclasses import dataclass
+ from datetime import datetime, timezone
++from pathlib import Path
+ 
+ from app.domain.enums import MessageKind, SenderType
+-from app.domain.rendering import MAX_GROUP_TEXT, group_history
+-from app.utils.text import TEXT_PACK_LIMIT, pack_html_sections
++from app.domain.rendering import group_history
++from app.utils.text import (
++    TELEGRAM_TEXT_LIMIT,
++    pack_html_sections,
++    split_for_html,
++    split_plain_text,
++    telegram_visible_length,
++)
+ 
+ 
+ @dataclass
+@@ -81,16 +88,22 @@ def test_photo_breaks_text_group_and_is_standalone() -> None:
+     assert blocks[1].source_message_ids == (2,)
+ 
+ 
+-def test_long_text_group_is_split() -> None:
+-    huge = "x" * (MAX_GROUP_TEXT + 500)
++def test_long_source_is_not_split_by_internal_rendering_limit() -> None:
++    huge = "Здравствуйте " * 300
++    assert len(huge) > 3000
+     blocks = group_history([msg(1, SenderType.USER.value, 100, huge)])
+-    assert len(blocks) == 2
+-    assert all(len(block.text or "") <= MAX_GROUP_TEXT for block in blocks)
++    assert len(blocks) == 1
++    assert blocks[0].text == huge
++
+ 
++def test_plain_splitter_uses_real_telegram_text_capacity() -> None:
++    text = "Я" * 4050
++    assert split_plain_text(text, 4050) == [text]
++    assert len(split_plain_text(text + "ещё", 4050)) == 2
+ 
+-def test_html_heavy_text_still_splits_safely() -> None:
++
++def test_html_heavy_compat_splitter_still_round_trips() -> None:
+     from html import escape
+-    from app.utils.text import split_for_html
+ 
+     chunks = split_for_html("&" * 1000, 3300)
+     assert len(chunks) == 2
+@@ -98,13 +111,12 @@ def test_html_heavy_text_still_splits_safely() -> None:
+     assert "".join(chunks) == "&" * 1000
+ 
+ 
+-def test_history_text_sections_from_different_authors_fit_one_telegram_message() -> None:
++def test_history_sections_from_different_authors_fit_one_telegram_message() -> None:
+     sections = [
+         "<b>👤 Zzzler</b> · <i>09.08 09:05 UTC</i>\n"
+         "<blockquote>Здравствуйте, у меня есть 2 уха и 2 глаза.\nКак вы могли бы мне помочь?</blockquote>",
+         "<b>🛡 Igor</b> · <i>09.08 09:05 UTC</i>\n"
+-        "<blockquote>Привет, а рот один?</blockquote>\n"
+-        "<i>↩️ после этого пользователь ответил</i>",
++        "<blockquote>Привет, а рот один?</blockquote>",
+         "<b>👤 Zzzler</b> · <i>09.08 09:05 UTC</i>\n"
+         "<blockquote>Да, один</blockquote>",
+     ]
+@@ -113,14 +125,26 @@ def test_history_text_sections_from_different_authors_fit_one_telegram_message()
+     assert "👤 Zzzler" in packed[0]
+     assert "🛡 Igor" in packed[0]
+     assert "Да, один" in packed[0]
+-    assert len(packed[0]) <= TEXT_PACK_LIMIT
++    assert telegram_visible_length(packed[0]) <= TELEGRAM_TEXT_LIMIT
+ 
+ 
+-def test_history_text_packer_respects_telegram_safety_limit() -> None:
+-    sections = ["A" * 2000, "B" * 2000, "C" * 100]
+-    packed = pack_html_sections(sections)
+-    assert len(packed) == 2
+-    assert all(len(item) <= TEXT_PACK_LIMIT for item in packed)
++def test_packer_counts_visible_text_not_html_source_length() -> None:
++    section = "<blockquote>" + ("&amp;" * 1000) + "</blockquote>"
++    assert len(section) > TELEGRAM_TEXT_LIMIT
++    assert telegram_visible_length(section) == 1000
++    assert pack_html_sections([section]) == [section]
++
++
++def test_delivery_proxy_marker_is_removed_from_view_code() -> None:
++    source = (Path(__file__).parents[1] / "app/services/views.py").read_text()
++    assert "после этого пользователь ответил" not in source
++    assert "✓ отправлено" not in source
++
++
++def test_history_controls_are_no_longer_inline_in_view_code() -> None:
++    source = (Path(__file__).parents[1] / "app/services/views.py").read_text()
++    assert "history_controls" not in source
++    assert "chat_controls_keyboard" in source
+ 
+ 
+ def test_default_history_page_size_is_ten() -> None:

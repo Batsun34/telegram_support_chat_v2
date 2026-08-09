@@ -1,0 +1,6 @@
+aiogram==3.30.0
+SQLAlchemy==2.0.51
+alembic==1.18.5
+aiosqlite==0.22.1
+pydantic==2.13.4
+pydantic-settings==2.14.2
